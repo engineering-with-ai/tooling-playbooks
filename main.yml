@@ -1,0 +1,158 @@
+- name: Choose setup type
+  hosts: all
+  vars:
+    setup_type: "dev-services"
+    debian_release: "trixie"
+    project_name: fsenergy
+    rust_version: "1.90.0"
+    python_version: "3.13.2"
+    uv_version: "0.10.9"
+    node_version: "22.14.0"
+    postgres_version: "15"
+    prometheus_version: "v3.1.0"
+    grafana_version: "11.5.1"
+    harbor_version: "2.12.2"
+    mlflow_version: "2.15.0"
+    mender_version: "mender-master"
+    hawkbit_version: "0.9.0"
+    coding_llm_name: "qwen3-coder:30b"
+    conversational_llm_name: "llama3.1:70b"
+    embedding_model: "nomic-embed-text:v1.5"
+    pgvector_version: "v0.8.0"
+    # Android development tooling
+    android_cmdline_tools_version: "11076708"
+    android_sdk_root: "/opt/android-sdk"
+    android_build_tools_version: "35.0.0"
+    android_api_levels: ["33", "34", "35"]
+    android_system_image: "system-images;android-33;google_apis_playstore;x86_64"
+    android_avd_name: "Pixel_6_API_33"
+    java_version: "17"
+    # Dev environment
+    dev_user: "dev"
+    vnc_display: ":1"
+    vnc_port: "5901"
+  vars_prompt:
+    - name: setup_type
+      prompt: "Choose setup type (dev-services/gitlab-runner/dev-environment/all) [default: dev-services]"
+      private: no
+      default: "dev-services"
+  vars_files:
+    - secrets.yml
+
+  become: yes
+  tasks:
+    - name: Ensure sources.list uses correct Debian release
+      copy:
+        dest: /etc/apt/sources.list
+        content: |
+          deb http://deb.debian.org/debian {{ debian_release }} main contrib non-free non-free-firmware
+          deb http://deb.debian.org/debian {{ debian_release }}-updates main contrib non-free non-free-firmware
+          deb http://security.debian.org/debian-security {{ debian_release }}-security main contrib non-free non-free-firmware
+        mode: "0644"
+        backup: yes
+      register: sources_list_changed
+      tags: [sources]
+
+    - name: Update apt cache after sources.list change
+      apt:
+        update_cache: yes
+      when: sources_list_changed.changed
+      tags: [sources]
+
+    - name: Install Base packages
+      apt:
+        name:
+          - vim
+          - git
+          - build-essential
+          - zsh
+          - python3-psycopg2
+          - ca-certificates
+          - cmake
+          - apache2-utils
+          - curl
+          - wget
+          - htop
+        state: present
+        update_cache: yes
+      tags: [base]
+    # shared dependencies
+    - name: Add Docker GPG apt Key
+      get_url:
+        url: https://download.docker.com/linux/debian/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+      tags: [docker]
+
+    - name: Add Docker Repository
+      ansible.builtin.shell: |
+        echo \
+        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+        $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+        tee /etc/apt/sources.list.d/docker.list > /dev/null
+      args:
+        creates: /etc/apt/sources.list.d/docker.list
+      tags: [docker]
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+      tags: [docker]
+
+    - name: Install Docker packages
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+      tags: [docker]
+
+    - name: Start Docker service
+      service:
+        name: docker
+        state: started
+        enabled: yes
+      tags: [docker]
+
+    - name: Create docker group
+      group:
+        name: docker
+        state: present
+      tags: [docker]
+
+    # shared: NodeSource + Node.js
+    - name: Add NodeSource GPG key
+      get_url:
+        url: https://deb.nodesource.com/gpgkey/nodesource.gpg.key
+        dest: /etc/apt/keyrings/nodesource.asc
+        mode: '0644'
+      tags: [nodejs]
+
+    - name: Add NodeSource repository
+      shell: curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+      args:
+        creates: /etc/apt/sources.list.d/nodesource.list
+      tags: [nodejs]
+
+    - name: Install Node.js
+      apt:
+        name: nodejs
+        state: present
+        update_cache: yes
+      tags: [nodejs]
+
+    - name: Run gitlab-runner setup
+      include_tasks: gitlab-runner-setup.yml
+      when: setup_type in ["gitlab-runner", "all"]
+
+    - name: Run dev services setup
+      include_tasks: dev-services-setup.yml
+      when: setup_type in ["dev-services", "all"]
+
+    - name: Run dev environment setup
+      include_tasks: dev-environment-setup.yml
+      when: setup_type in ["dev-environment", "all"]
+      tags: [dev-user, desktop, nvidia, vnc, dev-runtimes, gui-apps]

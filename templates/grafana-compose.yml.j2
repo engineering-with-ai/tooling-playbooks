@@ -1,0 +1,12 @@
+version: '3'
+services:
+  grafana:
+    image: grafana/grafana:{{ grafana_version }}
+    restart: unless-stopped
+    volumes:
+      - ./:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD={{ grafana_admin_password }}
+    ports:
+      - "3000:3000"
+    user: "472"

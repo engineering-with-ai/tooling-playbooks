@@ -1,0 +1,739 @@
+- name: Install GitLab Runner dependencies
+  apt:
+    name:
+      - libssl-dev
+      - zlib1g-dev
+      - libbz2-dev
+      - libreadline-dev
+      - libsqlite3-dev
+      - libffi-dev
+      - liblzma-dev
+      - pkg-config
+      - libssl-dev
+      - libudev-dev
+      - openjdk-17-jdk
+      - acl
+      - unzip
+      - libngspice0-dev
+      - qemu-kvm
+      - libvirt-daemon-system
+      - libvirt-clients
+      - bridge-utils
+    state: present
+    update_cache: yes
+
+- name: Set JAVA_HOME environment variable
+  lineinfile:
+    path: /etc/environment
+    line: 'JAVA_HOME="/usr/lib/jvm/java-17-openjdk-amd64"'
+    regexp: '^JAVA_HOME='
+    create: yes
+
+- name: Create Android SDK directory
+  file:
+    path: /opt/android-sdk
+    state: directory
+    owner: gitlab-runner
+    group: gitlab-runner
+    mode: "0755"
+
+- name: Download Android command line tools
+  get_url:
+    url: "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+    dest: "/tmp/android-cmdline-tools.zip"
+    mode: "0644"
+
+- name: Extract Android command line tools
+  unarchive:
+    src: "/tmp/android-cmdline-tools.zip"
+    dest: /opt/android-sdk
+    remote_src: yes
+    owner: gitlab-runner
+    group: gitlab-runner
+    creates: /opt/android-sdk/cmdline-tools
+
+- name: Move cmdline-tools to proper location
+  shell: |
+    if [ ! -d /opt/android-sdk/cmdline-tools/latest ]; then
+      mkdir -p /opt/android-sdk/cmdline-tools/latest
+      mv /opt/android-sdk/cmdline-tools/bin /opt/android-sdk/cmdline-tools/latest/
+      mv /opt/android-sdk/cmdline-tools/lib /opt/android-sdk/cmdline-tools/latest/
+      mv /opt/android-sdk/cmdline-tools/NOTICE.txt /opt/android-sdk/cmdline-tools/latest/ 2>/dev/null || true
+      mv /opt/android-sdk/cmdline-tools/source.properties /opt/android-sdk/cmdline-tools/latest/ 2>/dev/null || true
+      chown -R gitlab-runner:gitlab-runner /opt/android-sdk
+    fi
+  args:
+    creates: /opt/android-sdk/cmdline-tools/latest/bin
+
+- name: Accept Android SDK licenses
+  become_user: gitlab-runner
+  shell: yes | /opt/android-sdk/cmdline-tools/latest/bin/sdkmanager --licenses
+  args:
+    creates: /opt/android-sdk/licenses/android-sdk-license
+  environment:
+    ANDROID_HOME: /opt/android-sdk
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+
+- name: Install Android SDK platforms and build tools
+  become_user: gitlab-runner
+  shell: |
+    /opt/android-sdk/cmdline-tools/latest/bin/sdkmanager \
+      "platform-tools" \
+      "platforms;android-35" \
+      "platforms;android-34" \
+      "build-tools;35.0.0" \
+      "ndk;26.1.10909125"
+  args:
+    creates: /opt/android-sdk/platforms/android-35
+  environment:
+    ANDROID_HOME: /opt/android-sdk
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+
+- name: Set ANDROID_HOME environment variable
+  lineinfile:
+    path: /etc/environment
+    line: 'ANDROID_HOME="/opt/android-sdk"'
+    regexp: '^ANDROID_HOME='
+    create: yes
+
+- name: Set ANDROID_SDK_ROOT environment variable
+  lineinfile:
+    path: /etc/environment
+    line: 'ANDROID_SDK_ROOT="/opt/android-sdk"'
+    regexp: '^ANDROID_SDK_ROOT='
+    create: yes
+
+- name: Set ENV environment variable
+  lineinfile:
+    path: /etc/environment
+    line: 'ENV="ci"'
+    regexp: '^ENV='
+    create: yes
+
+- name: Set WIFI_PASSWORD environment variable
+  lineinfile:
+    path: /etc/environment
+    line: 'WIFI_PASSWORD="{{ ci_wifi_password }}"'
+    regexp: '^WIFI_PASSWORD='
+    create: yes
+
+- name: Set AWS_ACCESS_KEY_ID environment variable
+  lineinfile:
+    path: /etc/environment
+    line: 'AWS_ACCESS_KEY_ID="{{ aws_access_key_id }}"'
+    regexp: '^AWS_ACCESS_KEY_ID='
+    create: yes
+
+- name: Set AWS_SECRET_ACCESS_KEY environment variable
+  lineinfile:
+    path: /etc/environment
+    line: 'AWS_SECRET_ACCESS_KEY="{{ aws_secret_access_key }}"'
+    regexp: '^AWS_SECRET_ACCESS_KEY='
+    create: yes
+
+- name: Check if AWS CLI is installed
+  command: aws --version
+  register: aws_cli_check
+  changed_when: false
+  failed_when: false
+
+- name: Install AWS CLI v2
+  shell: |
+    curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+    cd /tmp && unzip -qo awscliv2.zip
+    /tmp/aws/install
+    rm -rf /tmp/aws /tmp/awscliv2.zip
+  when: aws_cli_check.rc != 0
+
+- name: Verify AWS CLI installation
+  command: aws --version
+  register: aws_cli_version
+  changed_when: false
+  failed_when: aws_cli_version.rc != 0
+
+- name: Add gitlab-runner to docker, kvm, and dialout groups
+  user:
+    name: gitlab-runner
+    groups: docker,kvm,dialout
+    append: yes
+  become: yes
+  register: runner_groups_changed
+
+- name: Restart GitLab Runner if groups changed (for dialout/kvm access)
+  systemd:
+    name: gitlab-runner
+    state: restarted
+  become: yes
+  when: runner_groups_changed.changed
+
+- name: Check if Gitlab Runner is already installed
+  stat:
+    path: "/etc/gitlab-runner/config.toml"
+  register: gitlab_runner_installed
+
+- name: Install Gitlab Runner
+  shell: curl -L "https://packages.gitlab.com/install/repositories/runner/gitlab-runner/script.deb.sh" | bash
+  args:
+    executable: /bin/bash
+  when: not gitlab_runner_installed.stat.exists
+
+- name: Install GitLab Runner package
+  apt:
+    name: gitlab-runner
+    state: present
+    update_cache: yes
+  when: not gitlab_runner_installed.stat.exists
+
+- name: Ensure GitLab Runner is started and enabled
+  systemd:
+    name: gitlab-runner
+    state: started
+    enabled: yes
+
+- name: Allow gitlab-runner to use sudo without password
+  lineinfile:
+    path: /etc/sudoers
+    line: "gitlab-runner ALL=(ALL) NOPASSWD: ALL"
+    validate: "visudo -cf %s"
+
+- name: Check if runner already exists in config
+  shell: grep -q 'name = "{{ project_name }}"' /etc/gitlab-runner/config.toml
+  register: runner_exists
+  failed_when: false
+  changed_when: false
+  become: yes
+
+- name: Register gitlab runner with gitlab.com
+  when: runner_exists.rc != 0
+  command:
+    cmd: >
+      gitlab-runner register
+      --non-interactive
+      --url "https://gitlab.com"
+      --registration-token "{{ gitlab_runner_token }}"
+      --name "{{ project_name }}"
+      --executor "shell"
+  become: yes
+
+- name: Check if Oh My Zsh is already installed for gitlab-runner
+  stat:
+    path: "/home/gitlab-runner/.oh-my-zsh"
+  register: runner_oh_my_zsh_installed
+
+- name: Install Oh My Zsh for gitlab-runner
+  become: yes
+  become_user: gitlab-runner
+  shell: sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+  args:
+    creates: "/home/gitlab-runner/.oh-my-zsh"
+  when: not runner_oh_my_zsh_installed.stat.exists
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Set Zsh as default shell for gitlab-runner
+  user:
+    name: "gitlab-runner"
+    shell: /bin/zsh
+
+- name: Check if Rust is installed for gitlab-runner
+  command: command -v rustc
+  register: rust_check
+  changed_when: false
+  failed_when: false
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Get current default Rust version
+  command: /home/gitlab-runner/.cargo/bin/rustc --version
+  register: current_rust_version
+  changed_when: false
+  failed_when: false
+  become: yes
+  become_user: gitlab-runner
+  when: rust_check.rc == 0
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Install Rust for gitlab-runner
+  shell: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  when: rust_check.rc != 0
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Install specific Rust version for gitlab-runner
+  command: /home/gitlab-runner/.cargo/bin/rustup install {{ rust_version }}
+  when: rust_check.rc != 0 or rust_check.rc == 0
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Set specific Rust version as default for gitlab-runner
+  command: /home/gitlab-runner/.cargo/bin/rustup default {{ rust_version }}
+  register: rust_version_changed
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Verify Rust installation and version
+  command: /home/gitlab-runner/.cargo/bin/rustc --version
+  register: rust_version_output
+  changed_when: false
+  failed_when: rust_version not in rust_version_output.stdout
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Determine if Rust version changed
+  set_fact:
+    rust_version_upgraded: "{{ rust_check.rc != 0 or (current_rust_version.stdout is defined and rust_version not in current_rust_version.stdout) }}"
+
+- name: Check if cargo-binstall is installed
+  command: /home/gitlab-runner/.cargo/bin/cargo-binstall --version
+  register: cargo_binstall_check
+  changed_when: false
+  failed_when: false
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Install cargo-binstall
+  command: /home/gitlab-runner/.cargo/bin/cargo install cargo-binstall
+  become: yes
+  become_user: gitlab-runner
+  when: cargo_binstall_check.rc != 0 or rust_version_upgraded
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Check if cargo tools are installed
+  shell: |
+    /home/gitlab-runner/.cargo/bin/cargo install --list | grep -E 'cargo-cmd|cargo-audit|cargo-udeps|cargo-espflash|espflash|ldproxy|cargo-binutils|cargo-nextest|cargo-tarpaulin'
+  register: installed_cargo_tools
+  changed_when: false
+  failed_when: false
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Install cargo-udeps with locked flag
+  command: /home/gitlab-runner/.cargo/bin/cargo install cargo-udeps --locked
+  become: yes
+  become_user: gitlab-runner
+  when: rust_version_upgraded or not (installed_cargo_tools.stdout is search('cargo-udeps'))
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Install other cargo tools via cargo install
+  shell: |
+    /home/gitlab-runner/.cargo/bin/cargo install cargo-cmd cargo-audit cargo-espflash espflash ldproxy cargo-binutils cargo-tarpaulin
+  become: yes
+  become_user: gitlab-runner
+  when: rust_version_upgraded or not (installed_cargo_tools.stdout is search('cargo-cmd') and
+    installed_cargo_tools.stdout is search('cargo-audit') and
+    installed_cargo_tools.stdout is search('cargo-espflash') and
+    installed_cargo_tools.stdout is search('espflash') and
+    installed_cargo_tools.stdout is search('ldproxy') and
+    installed_cargo_tools.stdout is search('cargo-binutils') and
+    installed_cargo_tools.stdout is search('cargo-tarpaulin'))
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Install cargo-nextest with locked flag
+  command: /home/gitlab-runner/.cargo/bin/cargo install cargo-nextest --locked
+  become: yes
+  become_user: gitlab-runner
+  when: rust_version_upgraded or not (installed_cargo_tools.stdout is search('cargo-nextest'))
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Check if probe-rs-tools is installed
+  command: /home/gitlab-runner/.cargo/bin/probe-rs --version
+  register: probe_rs_check
+  changed_when: false
+  failed_when: false
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Install probe-rs-tools from source (for glibc compatibility)
+  command: /home/gitlab-runner/.cargo/bin/cargo install probe-rs-tools --locked
+  become: yes
+  become_user: gitlab-runner
+  when: rust_version_upgraded or probe_rs_check.rc != 0
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Create udev rule for Espressif USB JTAG devices
+  copy:
+    dest: /etc/udev/rules.d/99-espressif.rules
+    content: |
+      # Espressif USB JTAG/serial debug unit
+      SUBSYSTEM=="usb", ATTR{idVendor}=="303a", ATTR{idProduct}=="1001", MODE="0666"
+    mode: '0644'
+  register: udev_rule_created
+
+- name: Reload udev rules
+  command: udevadm control --reload-rules
+  when: udev_rule_created.changed
+
+- name: Trigger udev to apply new rules
+  command: udevadm trigger
+  when: udev_rule_created.changed
+
+- name: Verify ESP32-C3 chip support in probe-rs
+  shell: /home/gitlab-runner/.cargo/bin/probe-rs chip list | grep -i esp32c3
+  register: esp32c3_support_check
+  changed_when: false
+  failed_when: esp32c3_support_check.rc != 0
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: List available probes
+  command: /home/gitlab-runner/.cargo/bin/probe-rs list
+  register: probe_list
+  changed_when: false
+  failed_when: false
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Get probe info
+  command: /home/gitlab-runner/.cargo/bin/probe-rs info
+  register: probe_info
+  changed_when: false
+  failed_when: false
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Reset ESP32-C3 chip
+  command: /home/gitlab-runner/.cargo/bin/probe-rs reset --chip esp32c3
+  register: esp32c3_reset
+  changed_when: false
+  failed_when: false
+  become: yes
+  become_user: gitlab-runner
+  when: probe_list.rc == 0 and 'ESP JTAG' in probe_list.stdout
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Add LLVM tools preview component
+  command: /home/gitlab-runner/.cargo/bin/rustup component add llvm-tools-preview
+  register: llvm_tools_result
+  changed_when: "'llvm-tools-preview is already installed' not in llvm_tools_result.stderr"
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Install nightly toolchain for rust-src
+  command: /home/gitlab-runner/.cargo/bin/rustup toolchain install nightly-x86_64-unknown-linux-gnu
+  register: nightly_toolchain_result
+  changed_when: "'nightly-x86_64-unknown-linux-gnu installed' in nightly_toolchain_result.stdout or 'downloading' in nightly_toolchain_result.stdout"
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Add rust-src component to nightly toolchain
+  command: /home/gitlab-runner/.cargo/bin/rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
+  register: rust_src_result
+  changed_when: "'rust-src is already installed' not in rust_src_result.stderr"
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Check if pyenv is installed for gitlab-runner
+  stat:
+    path: "/home/gitlab-runner/.pyenv"
+  register: pyenv_installed
+
+- name: Install pyenv for gitlab-runner
+  shell: curl -fsSL https://pyenv.run | bash
+  when: not pyenv_installed.stat.exists
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Add pyenv configuration to .zshrc
+  blockinfile:
+    path: /home/gitlab-runner/.zshrc
+    block: |
+      export PYENV_ROOT="$HOME/.pyenv"
+      [[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
+      eval "$(pyenv init - zsh)"
+    marker: "# {mark} ANSIBLE MANAGED BLOCK - PYENV CONFIGURATION"
+  become: yes
+  become_user: root
+
+- name: Install specific Python version
+  shell: source ~/.zshrc && pyenv install {{ python_version }}
+  args:
+    creates: "/home/gitlab-runner/.pyenv/versions/{{ python_version }}"
+    executable: /bin/bash
+  register: pyenv_install_result
+  changed_when: pyenv_install_result.rc == 0
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Set specific Python version as default for gitlab-runner
+  command: /home/gitlab-runner/.pyenv/bin/pyenv global {{ python_version }}
+  register: pyenv_install_result
+  changed_when: pyenv_install_result.rc == 0
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Verify Python installation and version
+  shell: source ~/.zshrc && python --version
+  args:
+    executable: /bin/bash
+  register: python_version_output
+  changed_when: false
+  failed_when: python_version not in python_version_output.stdout
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Check if uv is installed
+  command: /home/gitlab-runner/.local/bin/uv --version
+  register: uv_check
+  changed_when: false
+  failed_when: false
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Get current uv version
+  set_fact:
+    current_uv_version: "{{ uv_check.stdout | regex_search('[0-9]+\\.[0-9]+\\.[0-9]+') }}"
+  when: uv_check.rc == 0
+
+- name: Install or update uv
+  shell: curl -LsSf https://astral.sh/uv/{{ uv_version }}/install.sh | sh
+  become: yes
+  become_user: gitlab-runner
+  when: uv_check.rc != 0 or (current_uv_version is defined and current_uv_version != uv_version)
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Verify uv installation and version
+  command: /home/gitlab-runner/.local/bin/uv --version
+  register: uv_version_output
+  changed_when: false
+  failed_when: uv_version not in uv_version_output.stdout
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Verify Node.js installation
+  command: node --version
+  register: node_version_output
+  changed_when: false
+
+# Android Development Setup (Parameterized)
+- name: Check if Android SDK already exists
+  stat:
+    path: "{{ android_sdk_root }}/cmdline-tools/latest/bin/sdkmanager"
+  register: android_sdk_installed
+
+- name: Create Android SDK directory structure
+  file:
+    path: "{{ android_sdk_root }}/cmdline-tools"
+    state: directory
+    owner: gitlab-runner
+    group: gitlab-runner
+    mode: '0755'
+  when: not android_sdk_installed.stat.exists
+
+- name: Download Android Command Line Tools
+  get_url:
+    url: "https://dl.google.com/android/repository/commandlinetools-linux-{{ android_cmdline_tools_version }}_latest.zip"
+    dest: "/tmp/android-cmdline-tools.zip"
+    mode: '0644'
+  when: not android_sdk_installed.stat.exists
+
+- name: Extract Android Command Line Tools
+  unarchive:
+    src: "/tmp/android-cmdline-tools.zip"
+    dest: "{{ android_sdk_root }}/cmdline-tools"
+    remote_src: yes
+    owner: gitlab-runner
+    group: gitlab-runner
+  when: not android_sdk_installed.stat.exists
+
+- name: Move cmdline-tools to latest directory
+  shell: |
+    if [ ! -d "{{ android_sdk_root }}/cmdline-tools/latest" ]; then
+      mv {{ android_sdk_root }}/cmdline-tools/cmdline-tools {{ android_sdk_root }}/cmdline-tools/latest
+    fi
+  args:
+    creates: "{{ android_sdk_root }}/cmdline-tools/latest"
+  when: not android_sdk_installed.stat.exists
+
+- name: Set ownership of Android SDK directory
+  file:
+    path: "{{ android_sdk_root }}"
+    owner: gitlab-runner
+    group: gitlab-runner
+    recurse: yes
+  when: not android_sdk_installed.stat.exists
+
+- name: Check if Android SDK licenses are accepted
+  stat:
+    path: "{{ android_sdk_root }}/licenses/android-sdk-license"
+  register: android_licenses_accepted
+
+- name: Accept Android SDK licenses
+  shell: yes | {{ android_sdk_root }}/cmdline-tools/latest/bin/sdkmanager --licenses
+  become: yes
+  become_user: gitlab-runner
+  when: not android_licenses_accepted.stat.exists
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Check installed Android SDK components
+  shell: "{{ android_sdk_root }}/cmdline-tools/latest/bin/sdkmanager --list_installed"
+  register: installed_android_components
+  changed_when: false
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Install Android SDK platform-tools
+  command: "{{ android_sdk_root }}/cmdline-tools/latest/bin/sdkmanager platform-tools"
+  become: yes
+  become_user: gitlab-runner
+  when: "'platform-tools' not in installed_android_components.stdout"
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Install Android SDK build-tools
+  command: "{{ android_sdk_root }}/cmdline-tools/latest/bin/sdkmanager 'build-tools;{{ android_build_tools_version }}'"
+  become: yes
+  become_user: gitlab-runner
+  when: "'build-tools;' + android_build_tools_version not in installed_android_components.stdout"
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Install Android platforms
+  command: "{{ android_sdk_root }}/cmdline-tools/latest/bin/sdkmanager 'platforms;android-{{ item }}'"
+  loop: "{{ android_api_levels }}"
+  become: yes
+  become_user: gitlab-runner
+  when: "'platforms;android-' + item not in installed_android_components.stdout"
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Install Android emulator
+  command: "{{ android_sdk_root }}/cmdline-tools/latest/bin/sdkmanager emulator"
+  become: yes
+  become_user: gitlab-runner
+  when: "'emulator' not in installed_android_components.stdout"
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Install CMake
+  command: "{{ android_sdk_root }}/cmdline-tools/latest/bin/sdkmanager cmake"
+  become: yes
+  become_user: gitlab-runner
+  when: "'cmake' not in installed_android_components.stdout"
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Install NDK
+  command: "{{ android_sdk_root }}/cmdline-tools/latest/bin/sdkmanager ndk-bundle"
+  become: yes
+  become_user: gitlab-runner
+  when: "'ndk-bundle' not in installed_android_components.stdout"
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Install Android system image for emulator
+  command: "{{ android_sdk_root }}/cmdline-tools/latest/bin/sdkmanager '{{ android_system_image }}'"
+  become: yes
+  become_user: gitlab-runner
+  when: "android_system_image not in installed_android_components.stdout"
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Check if AVD exists
+  shell: "{{ android_sdk_root }}/emulator/emulator -list-avds"
+  register: avd_list
+  changed_when: false
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Create AVD for Detox testing
+  command: "{{ android_sdk_root }}/cmdline-tools/latest/bin/avdmanager create avd -n {{ android_avd_name }} -k '{{ android_system_image }}' -d pixel_6 --force"
+  become: yes
+  become_user: gitlab-runner
+  when: "android_avd_name not in avd_list.stdout"
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Configure JAVA_HOME in /etc/environment
+  lineinfile:
+    path: /etc/environment
+    regexp: '^JAVA_HOME='
+    line: 'JAVA_HOME="/usr/lib/jvm/java-{{ java_version }}-openjdk-amd64"'
+    state: present
+
+- name: Configure ANDROID_HOME in /etc/environment
+  lineinfile:
+    path: /etc/environment
+    regexp: '^ANDROID_HOME='
+    line: 'ANDROID_HOME="{{ android_sdk_root }}"'
+    state: present
+
+- name: Configure ANDROID_SDK_ROOT in /etc/environment
+  lineinfile:
+    path: /etc/environment
+    regexp: '^ANDROID_SDK_ROOT='
+    line: 'ANDROID_SDK_ROOT="{{ android_sdk_root }}"'
+    state: present
+
+- name: Add Android tools to PATH in /etc/environment
+  lineinfile:
+    path: /etc/environment
+    regexp: '^PATH='
+    line: 'PATH="{{ android_sdk_root }}/cmdline-tools/latest/bin:{{ android_sdk_root }}/platform-tools:{{ android_sdk_root }}/emulator:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"'
+    state: present
+
+- name: Add Android SDK configuration to .zshrc
+  blockinfile:
+    path: /home/gitlab-runner/.zshrc
+    block: |
+      export JAVA_HOME="/usr/lib/jvm/java-{{ java_version }}-openjdk-amd64"
+      export ANDROID_HOME="{{ android_sdk_root }}"
+      export ANDROID_SDK_ROOT="{{ android_sdk_root }}"
+      export PATH="{{ android_sdk_root }}/cmdline-tools/latest/bin:{{ android_sdk_root }}/platform-tools:{{ android_sdk_root }}/emulator:$PATH"
+    marker: "# {mark} ANSIBLE MANAGED BLOCK - ANDROID SDK CONFIGURATION"
+  become: yes
+  become_user: gitlab-runner
+  vars:
+    ansible_ssh_pipelining: true

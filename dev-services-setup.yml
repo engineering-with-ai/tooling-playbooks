@@ -1,0 +1,997 @@
+- name: Add users to docker group
+  user:
+    name: admin
+    groups: docker
+    append: yes
+  become: yes
+
+- name: Create Docker network 'public'
+  docker_network:
+    name: public
+    state: present
+
+- name: Check if Oh My Zsh is already installed for admin
+  stat:
+    path: "/home/admin/.oh-my-zsh"
+  register: admin_oh_my_zsh_installed
+
+- name: Install Oh My Zsh for admin user
+  become_user: "admin"
+  shell: sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+  args:
+    executable: /bin/bash
+  when: not admin_oh_my_zsh_installed.stat.exists
+
+- name: Set Zsh as default shell for admin user
+  user:
+    name: "admin"
+    shell: /bin/zsh
+
+- name: Install PostgreSQL
+  apt:
+    name:
+      - postgresql
+      - postgresql-contrib
+      - libpq-dev
+      - postgresql-server-dev-{{ postgres_version }}
+    state: present
+    update_cache: yes
+
+- name: Ensure PostgreSQL is started and enabled
+  systemd:
+    name: postgresql
+    state: started
+    enabled: yes
+
+- name: Check if PostgreSQL is running
+  command: systemctl is-active postgresql
+  register: postgres_status
+  changed_when: false
+  failed_when: false
+
+- name: Set password for PostgreSQL user
+  become: yes
+  become_user: postgres
+  postgresql_user:
+    name: postgres
+    password: "{{ postgres_password }}"
+  when: postgres_status.stdout == "active"
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Configure PostgreSQL to listen on all interfaces
+  lineinfile:
+    path: /etc/postgresql/{{ postgres_version }}/main/postgresql.conf
+    regexp: '^#?listen_addresses\s*='
+    line: "listen_addresses = '*'"
+  register: postgres_config_changed
+
+- name: Allow connections from Docker subnet in pg_hba.conf
+  lineinfile:
+    path: /etc/postgresql/{{ postgres_version }}/main/pg_hba.conf
+    line: "host    all    all    0.0.0.0/0    md5"
+  register: postgres_hba_changed
+
+- name: Restart PostgreSQL
+  systemd:
+    name: postgresql
+    state: restarted
+  when: postgres_config_changed.changed or postgres_hba_changed.changed
+
+- name: Add TimescaleDB GPG key
+  get_url:
+    url: https://packagecloud.io/timescale/timescaledb/gpgkey
+    dest: /etc/apt/keyrings/timescaledb-archive-keyring.asc
+    mode: "0644"
+
+- name: Add TimescaleDB repository
+  ansible.builtin.shell: |
+    echo "deb [signed-by=/etc/apt/keyrings/timescaledb-archive-keyring.asc] https://packagecloud.io/timescale/timescaledb/debian/ $(. /etc/os-release && echo "$VERSION_CODENAME") main" | \
+    tee /etc/apt/sources.list.d/timescaledb.list > /dev/null
+  args:
+    creates: /etc/apt/sources.list.d/timescaledb.list
+
+- name: Update apt cache for TimescaleDB
+  apt:
+    update_cache: yes
+
+- name: Install TimescaleDB packages
+  apt:
+    name: "timescaledb-2-postgresql-{{ postgres_version }}"
+    state: present
+
+- name: Check if TimescaleDB has been tuned
+  stat:
+    path: /tmp/timescaledb_tuned
+  register: timescaledb_tuned
+
+- name: Run TimescaleDB tune
+  command: timescaledb-tune --yes
+  register: timescaledb_tune_result
+  changed_when: timescaledb_tune_result.rc == 0
+  failed_when: timescaledb_tune_result.rc != 0 and 'Nothing was changed' not in timescaledb_tune_result.stderr
+  when: not timescaledb_tuned.stat.exists
+
+- name: Mark TimescaleDB as tuned
+  file:
+    path: /tmp/timescaledb_tuned
+    state: touch
+    mode: "0644"
+  when: timescaledb_tune_result is defined and timescaledb_tune_result is succeeded and not timescaledb_tune_result is skipped
+
+- name: Restart PostgreSQL to apply TimescaleDB settings
+  systemd:
+    name: postgresql
+    state: restarted
+  when: timescaledb_tune_result is defined and timescaledb_tune_result is succeeded and not timescaledb_tune_result is skipped
+
+- name: Create TimescaleDB extension in PostgreSQL databases
+  become: yes
+  become_user: postgres
+  postgresql_ext:
+    name: timescaledb
+    db: postgres
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Verify TimescaleDB extension installation
+  become: yes
+  become_user: postgres
+  shell: psql -d postgres -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'timescaledb';"
+  register: timescaledb_check
+  changed_when: false
+  failed_when: "'timescaledb' not in timescaledb_check.stdout"
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Install Redis
+  apt:
+    name: redis-server
+    state: present
+    update_cache: yes
+
+- name: Configure Redis to bind to all interfaces
+  lineinfile:
+    path: /etc/redis/redis.conf
+    regexp: '^bind 127\.0\.0\.1'
+    line: 'bind 0.0.0.0'
+    backup: yes
+
+
+- name: Configure Redis password authentication
+  lineinfile:
+    path: /etc/redis/redis.conf
+    regexp: '^# requirepass'
+    line: 'requirepass {{ redis_password }}'
+    backup: yes
+
+- name: Start and enable Redis service
+  systemd:
+    name: redis-server
+    state: started
+    enabled: yes
+
+- name: Add Neo4j GPG key
+  get_url:
+    url: https://debian.neo4j.com/neotechnology.gpg.key
+    dest: /tmp/neotechnology.gpg.key
+    mode: "0644"
+
+- name: Import Neo4j GPG key
+  shell: cat /tmp/neotechnology.gpg.key | gpg --dearmor | tee /etc/apt/keyrings/neotechnology.gpg > /dev/null
+  args:
+    creates: /etc/apt/keyrings/neotechnology.gpg
+
+- name: Add Neo4j repository
+  ansible.builtin.lineinfile:
+    path: /etc/apt/sources.list.d/neo4j.list
+    line: 'deb [signed-by=/etc/apt/keyrings/neotechnology.gpg] https://debian.neo4j.com stable latest'
+    create: yes
+
+- name: Update apt cache
+  apt:
+    update_cache: yes
+
+- name: Install Neo4j
+  apt:
+    name: neo4j
+    state: present
+
+- name: Configure Neo4j to accept remote connections
+  lineinfile:
+    path: /etc/neo4j/neo4j.conf
+    regexp: '^#?server.default_listen_address=0.0.0.0'
+    line: 'server.default_listen_address=0.0.0.0'
+    state: present
+  register: neo4j_remote_config
+
+- name: Configure Neo4j to allow remote access to bolt connector
+  lineinfile:
+    path: /etc/neo4j/neo4j.conf
+    regexp: '^#?dbms.connector.bolt.listen_address=:7687'
+    line: 'dbms.connector.bolt.listen_address=0.0.0.0:7687'
+    state: present
+  register: neo4j_bolt_config
+
+- name: Configure Neo4j HTTP connector for remote access
+  lineinfile:
+    path: /etc/neo4j/neo4j.conf
+    regexp: '^#?dbms.connector.http.listen_address=:7474'
+    line: 'dbms.connector.http.listen_address=0.0.0.0:7474'
+    state: present
+  register: neo4j_http_config
+
+- name: Check if Neo4j password is already set
+  stat:
+    path: /var/lib/neo4j/data/dbms/auth.ini
+  register: neo4j_auth_file
+
+- name: Set Neo4j initial password
+  command: neo4j-admin dbms set-initial-password {{ neo4j_password }}
+  when: not neo4j_auth_file.stat.exists
+  changed_when: true
+
+- name: Ensure Neo4j is started and enabled
+  systemd:
+    name: neo4j
+    state: started
+    enabled: yes
+
+- name: Restart Neo4j if configuration changed
+  systemd:
+    name: neo4j
+    state: restarted
+  when: neo4j_remote_config.changed or neo4j_bolt_config.changed or neo4j_http_config.changed or (not neo4j_auth_file.stat.exists)
+
+
+- name: Check if PGVector is already installed
+  stat:
+    path: /usr/share/postgresql/{{ postgres_version }}/extension/vector.control
+  register: pgvector_installed
+
+- name: Clone PGVector repository
+  git:
+    repo: https://github.com/pgvector/pgvector.git
+    dest: /tmp/pgvector
+    version: "{{ pgvector_version }}"
+  when: not pgvector_installed.stat.exists
+
+- name: Build and install PGVector
+  shell: |
+    cd /tmp/pgvector
+    make
+    make install
+  args:
+    creates: /usr/share/postgresql/{{ postgres_version }}/extension/vector.control
+
+- name: Create PGVector extension in PostgreSQL databases
+  become: yes
+  become_user: postgres
+  postgresql_ext:
+    name: vector
+    db: postgres
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Verify PGVector extension installation
+  become: yes
+  become_user: postgres
+  shell: psql -d postgres -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';"
+  register: pgvector_check
+  changed_when: false
+  failed_when: "'vector' not in pgvector_check.stdout"
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Clean up PGVector source
+  file:
+    path: /tmp/pgvector
+    state: absent
+
+- name: Download MinIO binary
+  get_url:
+    url: https://dl.min.io/server/minio/release/linux-amd64/minio
+    dest: /usr/local/bin/minio
+    mode: "0755"
+
+- name: Create MinIO group
+  group:
+    name: minio
+    state: present
+    system: yes
+
+- name: Create MinIO user
+  user:
+    name: minio
+    group: minio
+    system: yes
+    create_home: no
+
+- name: Create MinIO data directory
+  file:
+    path: /data/minio
+    state: directory
+    owner: minio
+    group: minio
+    mode: "0750"
+
+- name: Create MinIO systemd service file
+  template:
+    src: minio.service.j2
+    dest: /etc/systemd/system/minio.service
+    mode: "0644"
+
+- name: Reload systemd
+  systemd:
+    daemon_reload: yes
+
+- name: Start and enable MinIO service
+  systemd:
+    name: minio
+    state: started
+    enabled: yes
+
+- name: Check if MinIO is running
+  command: systemctl is-active minio
+  register: minio_status
+  changed_when: false
+  failed_when: false
+
+# MongoDB Installation
+- name: Add MongoDB GPG key
+  get_url:
+    url: https://www.mongodb.org/static/pgp/server-7.0.asc
+    dest: /tmp/mongodb-server-7.0.asc
+    mode: "0644"
+
+- name: Import MongoDB GPG key
+  shell: gpg -o /etc/apt/keyrings/mongodb-server-7.0.gpg --dearmor /tmp/mongodb-server-7.0.asc
+  args:
+    creates: /etc/apt/keyrings/mongodb-server-7.0.gpg
+
+- name: Add MongoDB repository
+  copy:
+    dest: /etc/apt/sources.list.d/mongodb-org-7.0.list
+    content: 'deb [arch=amd64,arm64 signed-by=/etc/apt/keyrings/mongodb-server-7.0.gpg] https://repo.mongodb.org/apt/debian bookworm/mongodb-org/7.0 main'
+    mode: "0644"
+
+- name: Update apt cache for MongoDB
+  apt:
+    update_cache: yes
+
+- name: Install MongoDB packages
+  apt:
+    name: mongodb-org
+    state: present
+
+- name: Create MongoDB data directory
+  file:
+    path: /var/lib/mongodb
+    state: directory
+    owner: mongodb
+    group: mongodb
+    mode: "0755"
+
+- name: Create MongoDB log directory
+  file:
+    path: /var/log/mongodb
+    state: directory
+    owner: mongodb
+    group: mongodb
+    mode: "0755"
+
+- name: Copy MongoDB configuration
+  template:
+    src: mongod.conf.j2
+    dest: /etc/mongod.conf
+    mode: "0644"
+  register: mongod_config_changed
+
+- name: Start and enable MongoDB service
+  systemd:
+    name: mongod
+    state: started
+    enabled: yes
+
+- name: Restart MongoDB if configuration changed
+  systemd:
+    name: mongod
+    state: restarted
+  when: mongod_config_changed.changed
+
+- name: Check if MongoDB is running
+  command: systemctl is-active mongod
+  register: mongodb_status
+  changed_when: false
+  failed_when: false
+
+- name: Check if K3s is already installed
+  stat:
+    path: /usr/local/bin/k3s
+  register: k3s_installed
+
+- name: Install K3s
+  shell: curl -sfL https://get.k3s.io | sh -
+  when: not k3s_installed.stat.exists
+
+- name: Wait for K3s to be ready
+  wait_for:
+    path: /etc/rancher/k3s/k3s.yaml
+    state: present
+    delay: 10
+  timeout: 300
+
+- name: Check if Ollama is already installed
+  stat:
+    path: /usr/local/bin/ollama
+  register: ollama_installed
+
+- name: Install Ollama
+  shell: |
+    curl -fsSL https://ollama.ai/install.sh | sh
+  when: not ollama_installed.stat.exists
+
+- name: Verify Ollama installation
+  command: ollama --version
+  register: ollama_version
+  changed_when: false
+  failed_when: ollama_version.rc != 0
+
+- name: Check if Ollama embedding model exists
+  shell: ollama list | grep "{{ embedding_model }}"
+  register: embedding_model_check
+  failed_when: false
+  changed_when: false
+
+- name: pull Ollama embedding model
+  shell: ollama pull {{ embedding_model }}
+  when: embedding_model_check.rc != 0
+
+- name: Check if Ollama coding model exists
+  shell: ollama list | grep "{{ coding_llm_name }}"
+  register: coding_model_check
+  failed_when: false
+  changed_when: false
+
+- name: Ollama Run Coding LLM # This may take a few minutes
+  shell: ollama run {{ coding_llm_name }}
+  register: model_run_result
+  changed_when: "'pulling manifest' in model_run_result.stdout"
+  when: coding_model_check.rc != 0
+
+- name: Check if Ollama conversational model exists
+  shell: ollama list | grep "{{ conversational_llm_name }}"
+  register: conversational_model_check
+  failed_when: false
+  changed_when: false
+
+- name: Ollama Run Conversational LLM # This may take a few minutes
+  shell: ollama run {{ conversational_llm_name }}
+  register: conversational_run_result
+  changed_when: "'pulling manifest' in conversational_run_result.stdout"
+  when: conversational_model_check.rc != 0
+
+- name: Configure Ollama to listen on all interfaces (0.0.0.0)
+  lineinfile:
+    path: /etc/systemd/system/ollama.service
+    regexp: '^Environment="OLLAMA_HOST=.*"'
+    line: 'Environment="OLLAMA_HOST=0.0.0.0"'
+    insertafter: '^\[Service\]'
+    state: present
+  register: ollama_config_changed
+
+- name: Reload systemd daemon if configuration changed
+  systemd:
+    daemon_reload: yes
+  when: ollama_config_changed.changed
+
+- name: Restart Ollama service if configuration changed
+  systemd:
+    name: ollama
+    state: restarted
+  when: ollama_config_changed.changed
+- name: Create a directory for Docker files
+  file:
+    path: /home/admin/docker
+    state: directory
+
+# Todo : Add Mender.io installation tasks
+
+- name: Install MinIO client
+  get_url:
+    url: https://dl.min.io/client/mc/release/linux-amd64/mc
+    dest: /usr/local/bin/mc
+    mode: "0755"
+
+- name: Check if 'mlflow' bucket exists in MinIO
+  shell: |
+    # Configure an alias called 'local' for our MinIO server
+    /usr/local/bin/mc alias set local http://localhost:9000 minioadmin {{ minio_password }}
+    # List the specific bucket using the alias
+    /usr/local/bin/mc ls local/mlflow
+  args:
+    executable: /bin/bash
+  register: mlflow_bucket_check
+  failed_when: false
+  changed_when: false
+
+- name: Create 'mlflow' bucket in MinIO
+  shell: |
+    # Configure an alias called 'local' for our MinIO server
+    /usr/local/bin/mc alias set local http://localhost:9000 minioadmin {{ minio_password }}
+    # Create the bucket using the alias
+    /usr/local/bin/mc mb local/mlflow
+  args:
+    executable: /bin/bash
+  when: mlflow_bucket_check.rc != 0
+
+- name: Create mlflow database
+  become: yes
+  become_user: postgres
+  postgresql_db:
+    name: mlflow
+    state: present
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Create MLflow directory
+  file:
+    path: /home/admin/docker/mlflow
+    state: directory
+    mode: "0755"
+
+- name: Copy MLflow docker-compose.yml
+  template:
+    src: mlflow-compose.yml.j2
+    dest: /home/admin/docker/mlflow/docker-compose.yml
+    mode: "0644"
+
+- name: Check if MLflow containers are running
+  command: docker compose ps -q
+  args:
+    chdir: /home/admin/docker/mlflow
+  register: mlflow_containers_check
+  changed_when: false
+  failed_when: false
+
+- name: Start MLflow using Docker Compose
+  command: docker compose up -d
+  args:
+    chdir: /home/admin/docker/mlflow
+  when: mlflow_containers_check.stdout == ""
+
+- name: Install F-Droid server
+  apt:
+    name: fdroidserver
+    state: present
+
+- name: Check if F-Droid config.yml exists
+  stat:
+    path: /home/admin/fdroid/config.yml
+  register: fdroid_config
+
+- name: Create F-Droid directory
+  file:
+    path: /home/admin/fdroid
+    state: directory
+    owner: admin
+    group: admin
+    mode: "0755"
+
+- name: Initialize F-Droid repository
+  become_user: admin
+  command: fdroid init
+  args:
+    chdir: /home/admin/fdroid
+    creates: /home/admin/fdroid/config.yml
+  when: not fdroid_config.stat.exists
+
+- name: Update config.yml with custom settings
+  become_user: admin
+  lineinfile:
+    path: /home/admin/fdroid/config.yml
+    line: "{{ item }}"
+  loop:
+    - "repo_url: http://{{ ansible_default_ipv4.address }}:8666/fdroid/repo"
+    - "repo_name: {{ project_name }}"
+  when: not fdroid_config.stat.exists
+
+- name: Set execute permission on /home/admin for gitlab-runner access
+  file:
+    path: /home/admin
+    mode: "0755"
+
+- name: Set permissions on /home/admin/fdroid for gitlab-runner access
+  file:
+    path: /home/admin/fdroid
+    mode: "0755"
+
+- name: Create F-Droid repo directory with write access for gitlab-runner
+  file:
+    path: /home/admin/fdroid/repo
+    state: directory
+    owner: admin
+    group: admin
+    mode: "0777"
+
+- name: Download Simple Flashlight test APK
+  become_user: admin
+  get_url:
+    url: "https://f-droid.org/repo/com.simplemobiletools.flashlight_66.apk"
+    dest: /home/admin/fdroid/repo/flashlight.apk
+    mode: "0644"
+    timeout: 120
+  register: flashlight_download
+  failed_when: false
+
+- name: Create F-Droid metadata directory
+  file:
+    path: /home/admin/fdroid/metadata
+    state: directory
+    owner: admin
+    group: admin
+    mode: "0777"
+
+- name: Create F-Droid srclibs directory with write access
+  file:
+    path: /home/admin/fdroid/srclibs
+    state: directory
+    owner: admin
+    group: admin
+    mode: "0777"
+
+- name: Create flashlight metadata file
+  become_user: admin
+  copy:
+    dest: /home/admin/fdroid/metadata/com.simplemobiletools.flashlight.yml
+    mode: "0644"
+    content: |
+      Categories:
+      - System
+      License: Apache-2.0
+      Name: Simple Flashlight
+      Summary: A simple flashlight app with LED, stroboscope and SOS
+      Description: |-
+        Simple Flashlight is a bright flashlight with a customizable stroboscope and predefined SOS mode.
+        All these functions come in handy in various situations and can turn your phone into a real survival tool.
+
+        Features:
+        * Bright LED light
+        * Customizable stroboscope
+        * SOS mode
+        * Material design
+        * No ads or unnecessary permissions
+  when: flashlight_download.changed
+
+- name: Check if F-Droid repository metadata exists
+  stat:
+    path: /home/admin/fdroid/repo/index-v1.json
+  register: fdroid_metadata_exists
+
+- name: Update F-Droid repository
+  become_user: admin
+  command: fdroid update --create-metadata
+  args:
+    chdir: /home/admin/fdroid
+  when: not fdroid_metadata_exists.stat.exists
+
+- name: Set full permissions on entire F-Droid directory for gitlab-runner
+  file:
+    path: /home/admin/fdroid
+    owner: admin
+    group: admin
+    state: directory
+    mode: "0777"
+    recurse: yes
+
+- name: Create F-Droid Nginx docker directory
+  file:
+    path: /home/admin/docker/fdroid-nginx
+    state: directory
+    mode: "0755"
+
+- name: Copy F-Droid Nginx configuration from template
+  template:
+    src: fdroid-nginx.conf.j2
+    dest: "/home/admin/docker/fdroid-nginx/nginx.conf"
+    mode: "0644"
+  register: fdroid_nginx_config
+
+- name: Copy F-Droid Nginx docker-compose.yml
+  template:
+    src: fdroid-nginx-compose.yml.j2
+    dest: /home/admin/docker/fdroid-nginx/docker-compose.yml
+    mode: "0644"
+
+- name: Check if F-Droid Nginx containers are running
+  command: docker compose ps -q
+  args:
+    chdir: /home/admin/docker/fdroid-nginx
+  register: fdroid_nginx_containers_check
+  changed_when: false
+  failed_when: false
+
+- name: Start F-Droid Nginx using Docker Compose
+  command: docker compose up -d
+  args:
+    chdir: /home/admin/docker/fdroid-nginx
+  when: fdroid_nginx_containers_check.stdout == ""
+
+- name: Restart F-Droid Nginx if config changed
+  command: docker restart fdroid-nginx
+  args:
+    chdir: /home/admin/docker/fdroid-nginx
+  when: fdroid_nginx_config.changed and fdroid_nginx_containers_check.stdout != ""
+
+- name: Create harbor database
+  become: yes
+  become_user: postgres
+  postgresql_db:
+    name: registry
+    state: present
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Create harbor directory
+  file:
+    path: /home/admin/docker/harbor
+    state: directory
+    mode: "0755"
+
+- name: Create harbor core config directory
+  file:
+    path: /home/admin/docker/harbor/core_config
+    state: directory
+    mode: "0755"
+
+- name: Generate Harbor private key
+  shell: openssl genrsa -traditional 4096 > /home/admin/docker/harbor/core_config/private_key.pem
+  args:
+    creates: /home/admin/docker/harbor/core_config/private_key.pem
+
+- name: Set permissions on Harbor private key
+  file:
+    path: /home/admin/docker/harbor/core_config/private_key.pem
+    mode: "0644"
+    owner: admin
+    group: admin
+
+- name: Copy Harbor docker-compose.yml
+  template:
+    src: harbor-compose.yml.j2
+    dest: /home/admin/docker/harbor/docker-compose.yml
+    mode: "0644"
+
+- name: Check if Harbor containers are running
+  command: docker compose ps -q
+  args:
+    chdir: /home/admin/docker/harbor
+  register: harbor_containers_check
+  changed_when: false
+  failed_when: false
+
+- name: Start Harbor using Docker Compose
+  command: docker compose up -d
+  args:
+    chdir: /home/admin/docker/harbor
+  when: harbor_containers_check.stdout == ""
+
+- name: Create Prometheus configuration directory
+  file:
+    path: /home/admin/docker/prometheus
+    state: directory
+    mode: "0755"
+
+- name: Create Prometheus configuration file
+  template:
+    src: prometheus.yml.j2
+    dest: /home/admin/docker/prometheus/prometheus.yml
+    mode: "0644"
+
+- name: Copy Prometheus docker-compose.yml
+  template:
+    src: prometheus-compose.yml.j2
+    dest: /home/admin/docker/prometheus/docker-compose.yml
+    mode: "0644"
+
+- name: Check if Prometheus containers are running
+  command: docker compose ps -q
+  args:
+    chdir: /home/admin/docker/prometheus
+  register: prometheus_containers_check
+  changed_when: false
+  failed_when: false
+
+- name: Start Prometheus using Docker Compose
+  command: docker compose up -d
+  args:
+    chdir: /home/admin/docker/prometheus
+  when: prometheus_containers_check.stdout == ""
+
+- name: Check if Prometheus is running
+  uri:
+    url: http://localhost:9090
+    method: GET
+  register: prometheus_status
+  ignore_errors: yes
+  changed_when: false
+
+- name: Create Grafana configuration directory
+  file:
+    path: /home/admin/docker/grafana
+    state: directory
+    mode: "0755"
+    owner: "472"
+    group: "472"
+
+- name: Copy Grafana docker-compose.yml
+  template:
+    src: grafana-compose.yml.j2
+    dest: /home/admin/docker/grafana/docker-compose.yml
+    mode: "0644"
+
+- name: Check if Grafana containers are running
+  command: docker compose ps -q
+  args:
+    chdir: /home/admin/docker/grafana
+  register: grafana_containers_check
+  changed_when: false
+  failed_when: false
+
+- name: Start Grafana using Docker Compose
+  command: docker compose up -d
+  args:
+    chdir: /home/admin/docker/grafana
+  when: grafana_containers_check.stdout == ""
+
+- name: Wait for Grafana to be ready
+  uri:
+    url: http://localhost:3000/api/health
+    method: GET
+  register: result
+  until: result.status == 200
+  retries: 60
+  delay: 1
+
+- name: Check if Prometheus data source exists in Grafana
+  uri:
+    url: "http://localhost:3000/api/datasources/name/Prometheus"
+    method: GET
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Basic {{ ('admin:your_secure_password' | b64encode) }}"
+  register: datasource_check
+  failed_when: false
+
+- name: Add Prometheus as a data source in Grafana
+  uri:
+    url: http://localhost:3000/api/datasources
+    method: POST
+    body_format: json
+    body:
+      name: "Prometheus"
+      type: "prometheus"
+      url: "http://prometheus:9090"
+      access: "proxy"
+      isDefault: true
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Basic {{ ('admin:your_secure_password' | b64encode) }}"
+  register: datasource_result
+  when: datasource_check.status == 404
+  failed_when:
+    - datasource_result.status != 200
+    - "'Datasource with same name already exists' not in datasource_result.json.message"
+
+- name: Ensure Prometheus data source is up to date
+  uri:
+    url: "http://localhost:3000/api/datasources/{{ datasource_check.json.id }}"
+    method: PUT
+    body_format: json
+    body:
+      name: "Prometheus"
+      type: "prometheus"
+      url: "http://prometheus:9090"
+      access: "proxy"
+      isDefault: true
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Basic {{ ('admin:' ~ grafana_admin_password) | b64encode }}"
+  when: datasource_check.status == 200
+  failed_when: false
+
+# Mender OTA Update Server
+- name: Check if 'mender' bucket exists in MinIO
+  shell: |
+    /usr/local/bin/mc alias set local http://localhost:9000 minioadmin {{ minio_password }}
+    /usr/local/bin/mc ls local/mender
+  args:
+    executable: /bin/bash
+  register: mender_bucket_check
+  failed_when: false
+  changed_when: false
+
+- name: Create 'mender' bucket in MinIO
+  shell: |
+    /usr/local/bin/mc alias set local http://localhost:9000 minioadmin {{ minio_password }}
+    /usr/local/bin/mc mb local/mender
+  args:
+    executable: /bin/bash
+  when: mender_bucket_check.rc != 0
+
+- name: Create Mender directory
+  file:
+    path: /home/admin/docker/mender
+    state: directory
+    mode: "0755"
+
+- name: Copy Mender docker-compose.yml
+  template:
+    src: mender-compose.yml.j2
+    dest: /home/admin/docker/mender/docker-compose.yml
+    mode: "0644"
+
+- name: Check if Mender containers are running
+  command: docker compose ps -q
+  args:
+    chdir: /home/admin/docker/mender
+  register: mender_containers_check
+  changed_when: false
+  failed_when: false
+
+- name: Start Mender using Docker Compose
+  command: docker compose up -d
+  args:
+    chdir: /home/admin/docker/mender
+  when: mender_containers_check.stdout == ""
+
+# HawkBit OTA Update Server
+- name: Create HawkBit directory
+  file:
+    path: /home/admin/docker/hawkbit
+    state: directory
+    mode: "0755"
+
+- name: Copy HawkBit docker-compose.yml
+  template:
+    src: hawkbit-compose.yml.j2
+    dest: /home/admin/docker/hawkbit/docker-compose.yml
+    mode: "0644"
+
+- name: Check if HawkBit containers are running
+  command: docker compose ps -q
+  args:
+    chdir: /home/admin/docker/hawkbit
+  register: hawkbit_containers_check
+  changed_when: false
+  failed_when: false
+
+- name: Start HawkBit using Docker Compose
+  command: docker compose up -d
+  args:
+    chdir: /home/admin/docker/hawkbit
+  when: hawkbit_containers_check.stdout == ""
+
+# print service URLs
+- name: Get public IP
+  ansible.builtin.uri:
+    url: http://ifconfig.me/ip
+    return_content: yes
+  register: public_ip
+
+- name: Create service URL table
+  set_fact:
+    service_urls:
+      - { name: "MinIO", url: "http://{{ public_ip.content | trim }}:9000" }
+      - { name: "MLflow", url: "http://{{ public_ip.content | trim }}:5000" }
+      - {
+          name: "F-Droid Server",
+          url: "http://{{ public_ip.content | trim }}:8666",
+        }
+      - { name: "Harbor", url: "http://{{ public_ip.content | trim }}:8083" }
+      - {
+          name: "Prometheus",
+          url: "http://{{ public_ip.content | trim }}:9090",
+        }
+      - { name: "Grafana", url: "http://{{ public_ip.content | trim }}:3000" }
+

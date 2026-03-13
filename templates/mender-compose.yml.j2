@@ -1,0 +1,62 @@
+networks:
+  public:
+    external: true
+
+services:
+  mender-nats:
+    image: nats:2.10-alpine
+    container_name: mender-nats
+    command: -js
+    restart: unless-stopped
+    networks:
+      public:
+
+  mender-workflows:
+    image: mendersoftware/workflows:{{ mender_version }}
+    container_name: mender-workflows
+    command: [server, --automigrate]
+    restart: unless-stopped
+    depends_on:
+      - mender-nats
+    environment:
+      - WORKFLOWS_MONGO_URL=mongodb://host.docker.internal:27017
+      - WORKFLOWS_NATS_URI=nats://mender-nats:4222
+    networks:
+      public:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  mender-inventory:
+    image: mendersoftware/inventory:{{ mender_version }}
+    container_name: mender-inventory
+    command: [server, --automigrate]
+    restart: unless-stopped
+    environment:
+      - INVENTORY_MONGO=mongodb://host.docker.internal:27017
+    networks:
+      public:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  mender-deployments:
+    image: mendersoftware/deployments:{{ mender_version }}
+    container_name: mender-deployments
+    command: [server, --automigrate]
+    restart: unless-stopped
+    ports:
+      - "8085:8080"
+    depends_on:
+      - mender-workflows
+      - mender-inventory
+    environment:
+      - DEPLOYMENTS_MONGO_URL=mongodb://host.docker.internal:27017
+      - DEPLOYMENTS_AWS_URI=http://host.docker.internal:9000
+      - DEPLOYMENTS_AWS_AUTH_KEY=minioadmin
+      - DEPLOYMENTS_AWS_AUTH_SECRET={{ minio_password }}
+      - DEPLOYMENTS_STORAGE_BUCKET=mender
+      - DEPLOYMENTS_MENDER_WORKFLOWS=http://mender-workflows:8080
+      - DEPLOYMENTS_INVENTORY_ADDR=http://mender-inventory:8080
+    networks:
+      public:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

@@ -1,0 +1,46 @@
+version: '3'
+services:
+  registry:
+    image: registry:2
+    container_name: harbor-registry
+    volumes:
+      - registry-data:/var/lib/registry
+    networks:
+      - public
+
+  core:
+    image: goharbor/harbor-core:v2.5.0
+    container_name: harbor-core
+    environment:
+      DATABASE_TYPE: postgresql
+      POSTGRESQL_HOST: host.docker.internal
+      POSTGRESQL_PORT: 5432
+      POSTGRESQL_DATABASE: registry
+      POSTGRESQL_USERNAME: postgres
+      POSTGRESQL_PASSWORD: {{ postgres_password }}
+      POSTGRESQL_SSLMODE: disable
+      HARBOR_ADMIN_PASSWORD: {{ harbor_admin_password }}
+      EXT_ENDPOINT: http://{{ ansible_default_ipv4.address }}:8083
+      REGISTRY_URL: http://registry:5000
+      TOKEN_SERVICE_URL: http://core:8080/service/token
+      CORE_URL: http://core:8080
+      _REDIS_URL_CORE: redis://:{{ redis_password }}@host.docker.internal:6379/0
+      _REDIS_URL_REG: redis://:{{ redis_password }}@host.docker.internal:6379/1
+      LOG_LEVEL: info
+    volumes:
+      - ./core_config/private_key.pem:/etc/core/private_key.pem:ro
+    depends_on:
+      - registry
+    ports:
+      - "8083:8080"
+    networks:
+      - public
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  registry-data:
+
+networks:
+  public:
+    external: true

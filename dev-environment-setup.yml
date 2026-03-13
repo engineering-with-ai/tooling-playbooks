@@ -1,0 +1,382 @@
+# Dev Environment Setup
+# AI-assisted dev server: Claude Code + GUI engineering apps over VNC.
+# Connect from any client (macbook, etc.) via SSH + TurboVNC.
+
+# --- User setup ---
+- name: Create dev user
+  user:
+    name: "{{ dev_user }}"
+    shell: /bin/zsh
+    groups: docker,dialout
+    append: yes
+    create_home: yes
+  tags: [dev-user]
+
+- name: Allow dev user to use sudo without password
+  lineinfile:
+    path: /etc/sudoers
+    line: "{{ dev_user }} ALL=(ALL) NOPASSWD: ALL"
+    validate: "visudo -cf %s"
+  tags: [dev-user]
+
+- name: Check if Oh My Zsh is installed for dev user
+  stat:
+    path: "/home/{{ dev_user }}/.oh-my-zsh"
+  register: dev_oh_my_zsh_installed
+  tags: [dev-user]
+
+- name: Install Oh My Zsh for dev user
+  become_user: "{{ dev_user }}"
+  shell: sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+  args:
+    creates: "/home/{{ dev_user }}/.oh-my-zsh"
+  when: not dev_oh_my_zsh_installed.stat.exists
+  vars:
+    ansible_ssh_pipelining: true
+  tags: [dev-user]
+
+# --- Minimal X11 for VNC ---
+- name: Install X11 packages for VNC
+  apt:
+    name:
+      - xorg
+      - x11-xserver-utils
+      - xclip
+      - fonts-dejavu
+      - fonts-hack
+      - dbus-x11
+    state: present
+    update_cache: yes
+  tags: [desktop]
+
+# --- NVIDIA drivers + CUDA ---
+- name: Install NVIDIA drivers and OpenGL libraries
+  apt:
+    name:
+      - nvidia-driver
+      - libgl1-mesa-dri
+      - libglu1-mesa
+      - mesa-utils
+    state: present
+  tags: [nvidia]
+
+- name: Add NVIDIA CUDA keyring
+  get_url:
+    url: "https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb"
+    dest: /tmp/cuda-keyring.deb
+    mode: "0644"
+  tags: [nvidia]
+
+- name: Install CUDA keyring
+  apt:
+    deb: /tmp/cuda-keyring.deb
+  tags: [nvidia]
+
+- name: Install CUDA toolkit
+  apt:
+    name: cuda-toolkit
+    state: present
+    update_cache: yes
+  tags: [nvidia]
+
+- name: Add NVIDIA Container Toolkit GPG key
+  shell: |
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  args:
+    creates: /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  tags: [nvidia]
+
+- name: Add NVIDIA Container Toolkit repository
+  shell: |
+    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+    tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+  args:
+    creates: /etc/apt/sources.list.d/nvidia-container-toolkit.list
+  tags: [nvidia]
+
+- name: Install NVIDIA Container Toolkit
+  apt:
+    name: nvidia-container-toolkit
+    state: present
+    update_cache: yes
+  tags: [nvidia]
+
+- name: Configure Docker for NVIDIA runtime
+  command: nvidia-ctk runtime configure --runtime=docker
+  register: nvidia_docker_config
+  changed_when: nvidia_docker_config.rc == 0
+  tags: [nvidia]
+
+- name: Restart Docker after NVIDIA runtime config
+  service:
+    name: docker
+    state: restarted
+  when: nvidia_docker_config.changed
+  tags: [nvidia]
+
+# --- VirtualGL ---
+- name: Check if VirtualGL is installed
+  command: dpkg -l virtualgl
+  register: virtualgl_check
+  changed_when: false
+  failed_when: false
+  tags: [vnc]
+
+- name: Download VirtualGL deb
+  get_url:
+    url: "https://github.com/VirtualGL/virtualgl/releases/download/3.1.2/virtualgl_3.1.2_amd64.deb"
+    dest: /tmp/virtualgl.deb
+    mode: "0644"
+  when: virtualgl_check.rc != 0
+  tags: [vnc]
+
+- name: Install VirtualGL
+  apt:
+    deb: /tmp/virtualgl.deb
+  when: virtualgl_check.rc != 0
+  tags: [vnc]
+
+- name: Configure VirtualGL server
+  command: /opt/VirtualGL/bin/vglserver_config -config +s +f -t
+  args:
+    creates: /etc/opt/VirtualGL/vgl_xauth_key
+  tags: [vnc]
+
+# --- TurboVNC ---
+- name: Check if TurboVNC is installed
+  command: dpkg -l turbovnc
+  register: turbovnc_check
+  changed_when: false
+  failed_when: false
+  tags: [vnc]
+
+- name: Download TurboVNC deb
+  get_url:
+    url: "https://github.com/TurboVNC/turbovnc/releases/download/3.1.3/turbovnc_3.1.3_amd64.deb"
+    dest: /tmp/turbovnc.deb
+    mode: "0644"
+  when: turbovnc_check.rc != 0
+  tags: [vnc]
+
+- name: Install TurboVNC
+  apt:
+    deb: /tmp/turbovnc.deb
+  when: turbovnc_check.rc != 0
+  tags: [vnc]
+
+- name: Create .vnc directory for dev user
+  file:
+    path: "/home/{{ dev_user }}/.vnc"
+    state: directory
+    owner: "{{ dev_user }}"
+    group: "{{ dev_user }}"
+    mode: "0755"
+  tags: [vnc]
+
+- name: Create TurboVNC xstartup for dev user
+  copy:
+    dest: "/home/{{ dev_user }}/.vnc/xstartup.turbovnc"
+    content: |
+      #!/bin/sh
+      unset SESSION_MANAGER
+      unset DBUS_SESSION_BUS_ADDRESS
+      export XDG_SESSION_TYPE=x11
+      exec xterm
+    owner: "{{ dev_user }}"
+    group: "{{ dev_user }}"
+    mode: "0755"
+  tags: [vnc]
+
+# --- Dev runtimes (pyenv, Rust, uv, Node) ---
+- name: Install Python build dependencies
+  apt:
+    name:
+      - libssl-dev
+      - zlib1g-dev
+      - libbz2-dev
+      - libreadline-dev
+      - libsqlite3-dev
+      - libffi-dev
+      - liblzma-dev
+    state: present
+  tags: [dev-runtimes]
+
+- name: Check if pyenv is installed for dev user
+  stat:
+    path: "/home/{{ dev_user }}/.pyenv"
+  register: dev_pyenv_installed
+  tags: [dev-runtimes]
+
+- name: Install pyenv for dev user
+  shell: curl -fsSL https://pyenv.run | bash
+  become_user: "{{ dev_user }}"
+  when: not dev_pyenv_installed.stat.exists
+  vars:
+    ansible_ssh_pipelining: true
+  tags: [dev-runtimes]
+
+- name: Add pyenv config to dev user .zshrc
+  blockinfile:
+    path: "/home/{{ dev_user }}/.zshrc"
+    block: |
+      export PYENV_ROOT="$HOME/.pyenv"
+      [[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
+      eval "$(pyenv init - zsh)"
+    marker: "# {mark} ANSIBLE MANAGED BLOCK - PYENV"
+  tags: [dev-runtimes]
+
+- name: Install Python version for dev user
+  shell: source ~/.zshrc && pyenv install {{ python_version }}
+  args:
+    creates: "/home/{{ dev_user }}/.pyenv/versions/{{ python_version }}"
+    executable: /bin/bash
+  become_user: "{{ dev_user }}"
+  vars:
+    ansible_ssh_pipelining: true
+  tags: [dev-runtimes]
+
+- name: Set Python version as default for dev user
+  command: "/home/{{ dev_user }}/.pyenv/bin/pyenv global {{ python_version }}"
+  become_user: "{{ dev_user }}"
+  vars:
+    ansible_ssh_pipelining: true
+  tags: [dev-runtimes]
+
+- name: Check if uv is installed for dev user
+  command: "/home/{{ dev_user }}/.local/bin/uv --version"
+  register: dev_uv_check
+  changed_when: false
+  failed_when: false
+  become_user: "{{ dev_user }}"
+  vars:
+    ansible_ssh_pipelining: true
+  tags: [dev-runtimes]
+
+- name: Install uv for dev user
+  shell: "curl -LsSf https://astral.sh/uv/{{ uv_version }}/install.sh | sh"
+  become_user: "{{ dev_user }}"
+  when: dev_uv_check.rc != 0 or (dev_uv_check.stdout is defined and uv_version not in dev_uv_check.stdout)
+  vars:
+    ansible_ssh_pipelining: true
+  tags: [dev-runtimes]
+
+- name: Check if Rust is installed for dev user
+  command: "/home/{{ dev_user }}/.cargo/bin/rustc --version"
+  register: dev_rust_check
+  changed_when: false
+  failed_when: false
+  become_user: "{{ dev_user }}"
+  vars:
+    ansible_ssh_pipelining: true
+  tags: [dev-runtimes]
+
+- name: Install Rust for dev user
+  shell: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  become_user: "{{ dev_user }}"
+  when: dev_rust_check.rc != 0
+  vars:
+    ansible_ssh_pipelining: true
+  tags: [dev-runtimes]
+
+- name: Install and set Rust version for dev user
+  shell: |
+    /home/{{ dev_user }}/.cargo/bin/rustup install {{ rust_version }}
+    /home/{{ dev_user }}/.cargo/bin/rustup default {{ rust_version }}
+  become_user: "{{ dev_user }}"
+  vars:
+    ansible_ssh_pipelining: true
+  tags: [dev-runtimes]
+
+# --- Engineering GUI apps (what Claude Code drives) ---
+- name: Install FreeCAD and KiCad
+  apt:
+    name:
+      - freecad
+      - kicad
+    state: present
+  tags: [gui-apps]
+
+- name: Install engineering tools
+  apt:
+    name:
+      - gmsh
+      - libngspice0-dev
+      - pandoc
+      - firefox-esr
+      - xterm
+    state: present
+  tags: [gui-apps]
+
+# calculix-ccx not in Trixie — install from sid with pinning
+- name: Add sid repository for calculix
+  copy:
+    dest: /etc/apt/sources.list.d/sid.list
+    content: "deb http://deb.debian.org/debian sid main\n"
+    mode: "0644"
+  tags: [gui-apps]
+
+- name: Pin sid packages to low priority
+  copy:
+    dest: /etc/apt/preferences.d/sid-pin
+    content: |
+      Package: *
+      Pin: release a=unstable
+      Pin-Priority: 100
+
+      Package: calculix-ccx
+      Pin: release a=unstable
+      Pin-Priority: 500
+    mode: "0644"
+  tags: [gui-apps]
+
+- name: Update only sid repo cache
+  shell: apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/sid.list -o Dir::Etc::sourceparts=/dev/null
+  changed_when: false
+  tags: [gui-apps]
+
+- name: Install calculix-ccx from sid
+  apt:
+    name: calculix-ccx
+    default_release: unstable
+    state: present
+  tags: [gui-apps]
+
+# tectonic (LaTeX) — not in Debian repos, install prebuilt binary from GitHub
+- name: Check if tectonic is installed
+  command: "/home/{{ dev_user }}/.local/bin/tectonic --version"
+  register: tectonic_check
+  changed_when: false
+  failed_when: false
+  become_user: "{{ dev_user }}"
+  vars:
+    ansible_ssh_pipelining: true
+  tags: [gui-apps]
+
+- name: Download tectonic binary
+  get_url:
+    url: "https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic@0.15.0/tectonic-0.15.0-x86_64-unknown-linux-gnu.tar.gz"
+    dest: /tmp/tectonic.tar.gz
+    mode: "0644"
+  when: tectonic_check.rc != 0
+  tags: [gui-apps]
+
+- name: Install tectonic binary
+  shell: |
+    tar xzf /tmp/tectonic.tar.gz -C /tmp
+    install -m 755 /tmp/tectonic /home/{{ dev_user }}/.local/bin/tectonic
+    chown {{ dev_user }}:{{ dev_user }} /home/{{ dev_user }}/.local/bin/tectonic
+    rm -f /tmp/tectonic /tmp/tectonic.tar.gz
+  args:
+    creates: "/home/{{ dev_user }}/.local/bin/tectonic"
+  when: tectonic_check.rc != 0
+  tags: [gui-apps]
+
+- name: Install CadQuery for dev user
+  shell: "/home/{{ dev_user }}/.local/bin/uv pip install --python /home/{{ dev_user }}/.pyenv/versions/{{ python_version }}/bin/python cadquery"
+  become_user: "{{ dev_user }}"
+  register: cadquery_install
+  changed_when: "'already satisfied' not in cadquery_install.stdout"
+  vars:
+    ansible_ssh_pipelining: true
+  tags: [gui-apps]
