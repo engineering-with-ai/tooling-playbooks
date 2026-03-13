@@ -288,6 +288,25 @@
     ansible_ssh_pipelining: true
   tags: [dev-runtimes]
 
+# --- Claude Code ---
+- name: Check if Claude Code is installed for dev user
+  command: "/home/{{ dev_user }}/.local/bin/claude --version"
+  register: dev_claude_code_check
+  changed_when: false
+  failed_when: false
+  become_user: "{{ dev_user }}"
+  vars:
+    ansible_ssh_pipelining: true
+  tags: [claude-code]
+
+- name: Install Claude Code for dev user
+  shell: curl -fsSL https://claude.ai/install.sh | bash
+  become_user: "{{ dev_user }}"
+  when: dev_claude_code_check.rc != 0
+  vars:
+    ansible_ssh_pipelining: true
+  tags: [claude-code]
+
 # --- Engineering GUI apps (what Claude Code drives) ---
 - name: Install FreeCAD and KiCad
   apt:
