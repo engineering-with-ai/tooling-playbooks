@@ -15,6 +15,11 @@
       - acl
       - unzip
       - libngspice0-dev
+      - ngspice
+      - freecad
+      - xvfb
+      - librsvg2-bin
+      - fonts-osifont
       - qemu-kvm
       - libvirt-daemon-system
       - libvirt-clients
@@ -717,11 +722,13 @@
     line: 'ANDROID_SDK_ROOT="{{ android_sdk_root }}"'
     state: present
 
-- name: Add Android tools to PATH in /etc/environment
+- name: Ensure /etc/environment PATH does not include user-owned directories
+  # Reason: Android SDK dirs owned by gitlab-runner break Perl taint mode in pg_ctlcluster.
+  # Android SDK PATH is already set in gitlab-runner's .zshrc below.
   lineinfile:
     path: /etc/environment
     regexp: '^PATH='
-    line: 'PATH="{{ android_sdk_root }}/cmdline-tools/latest/bin:{{ android_sdk_root }}/platform-tools:{{ android_sdk_root }}/emulator:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"'
+    line: 'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"'
     state: present
 
 - name: Add Android SDK configuration to .zshrc

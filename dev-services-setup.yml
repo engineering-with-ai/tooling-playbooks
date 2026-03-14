@@ -37,11 +37,35 @@
     state: present
     update_cache: yes
 
+- name: Fix pg_ctlcluster taint mode for Perl 5.40+ (Trixie/Sid)
+  # Reason: Perl 5.40 deprecated -T (taint mode), causing pg_ctlcluster to
+  # fail with "Insecure directory in $ENV{PATH}". The script already sanitizes
+  # its env via prepare_exec, so -T is redundant.
+  replace:
+    path: /usr/bin/pg_ctlcluster
+    regexp: '^#!/usr/bin/perl -wT'
+    replace: '#!/usr/bin/perl -w'
+  register: pg_ctlcluster_fixed
+
 - name: Ensure PostgreSQL is started and enabled
   systemd:
     name: postgresql
     state: started
     enabled: yes
+
+- name: Refresh collation version on all databases
+  # Reason: OS glibc upgrades change collation versions, causing PostgreSQL to
+  # emit WARNING on every connection. pgconn <v1.12 (used by Harbor v2.5.0)
+  # crashes on NoticeResponse during startup handshake.
+  become: yes
+  become_user: postgres
+  shell: |
+    for db in $(psql -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname != 'template0'"); do
+      psql -d "$db" -c "ALTER DATABASE \"$db\" REFRESH COLLATION VERSION;" 2>/dev/null
+    done
+  changed_when: false
+  vars:
+    ansible_ssh_pipelining: true
 
 - name: Check if PostgreSQL is running
   command: systemctl is-active postgresql

@@ -3,6 +3,7 @@ services:
   registry:
     image: registry:2
     container_name: harbor-registry
+    restart: always
     volumes:
       - registry-data:/var/lib/registry
     networks:
@@ -11,6 +12,7 @@ services:
   core:
     image: goharbor/harbor-core:v2.5.0
     container_name: harbor-core
+    restart: always
     environment:
       DATABASE_TYPE: postgresql
       POSTGRESQL_HOST: host.docker.internal
