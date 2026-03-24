@@ -1,0 +1,12 @@
+[Unit]
+Description=Hairpin NAT rules for Hoppy.network VPN
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hairpin-nat.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

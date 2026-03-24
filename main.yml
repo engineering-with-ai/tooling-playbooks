@@ -18,6 +18,7 @@
     coding_llm_name: "qwen3-coder:30b"
     conversational_llm_name: "llama3.1:70b"
     embedding_model: "nomic-embed-text:v1.5"
+    external_ip: "173.211.12.43"
     pgvector_version: "v0.8.0"
     # Android development tooling
     android_cmdline_tools_version: "11076708"

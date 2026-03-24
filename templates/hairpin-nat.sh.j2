@@ -1,0 +1,14 @@
+#!/bin/bash
+# Hairpin NAT rules for Hoppy.network VPN
+# Docker services redirect to the external IP ({{ external_ip }}) for auth/tokens.
+# The server can't reach itself on the WireGuard IP, so we DNAT back to localhost.
+# Must run AFTER Docker starts (Docker overwrites NAT tables on startup).
+
+PORTS=(8083 5000 8081 3000 9090 8666)
+
+for port in "${PORTS[@]}"; do
+  if ! iptables -t nat -C OUTPUT -d {{ external_ip }} -p tcp --dport "$port" -j DNAT --to-destination 127.0.0.1:"$port" 2>/dev/null; then
+    iptables -t nat -I OUTPUT 1 -d {{ external_ip }} -p tcp --dport "$port" -j DNAT --to-destination 127.0.0.1:"$port"
+    echo "Added hairpin NAT for port $port"
+  fi
+done

@@ -5,6 +5,27 @@
     append: yes
   become: yes
 
+- name: Install hairpin NAT script for Hoppy.network VPN
+  template:
+    src: templates/hairpin-nat.sh.j2
+    dest: /usr/local/bin/hairpin-nat.sh
+    mode: '0755'
+  become: yes
+
+- name: Install hairpin NAT systemd service
+  template:
+    src: templates/hairpin-nat.service.j2
+    dest: /etc/systemd/system/hairpin-nat.service
+  become: yes
+
+- name: Enable hairpin NAT service (runs after Docker on boot)
+  systemd:
+    name: hairpin-nat
+    enabled: yes
+    daemon_reload: yes
+    state: started
+  become: yes
+
 - name: Create Docker network 'public'
   docker_network:
     name: public
