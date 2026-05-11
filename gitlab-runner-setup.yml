@@ -34,6 +34,17 @@
     regexp: '^JAVA_HOME='
     create: yes
 
+- name: Set LOCALSTACK_AUTH_TOKEN in /etc/environment
+  lineinfile:
+    path: /etc/environment
+    line: 'LOCALSTACK_AUTH_TOKEN="{{ localstack_auth_token }}"'
+    regexp: '^LOCALSTACK_AUTH_TOKEN='
+    create: yes
+    mode: "0644"
+  no_log: true
+  when: localstack_auth_token is defined and localstack_auth_token | length > 0
+  tags: [localstack]
+
 - name: Create Android SDK directory
   file:
     path: /opt/android-sdk

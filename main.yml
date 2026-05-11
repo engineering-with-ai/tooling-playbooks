@@ -19,6 +19,7 @@
     conversational_llm_name: "llama3.1:70b"
     embedding_model: "nomic-embed-text:v1.5"
     external_ip: "173.211.12.43"
+    pi_tailscale_ip: "100.126.118.103"
     pgvector_version: "v0.8.0"
     # Android development tooling
     android_cmdline_tools_version: "11076708"
@@ -148,6 +149,7 @@
     - name: Run gitlab-runner setup
       include_tasks: gitlab-runner-setup.yml
       when: setup_type in ["gitlab-runner", "all"]
+      tags: [gitlab-runner, localstack]
 
     - name: Run dev services setup
       include_tasks: dev-services-setup.yml
