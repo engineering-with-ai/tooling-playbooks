@@ -24,6 +24,12 @@
       - libvirt-daemon-system
       - libvirt-clients
       - bridge-utils
+      # ARCNODE ISO build (live-build + ISO mastering + chroot bootstrap).
+      # Used by the platform-ems-iso bake job to produce arcnode-ems-*.iso.
+      - live-build
+      - squashfs-tools
+      - xorriso
+      - debootstrap
     state: present
     update_cache: yes
 
@@ -755,3 +761,77 @@
   become_user: gitlab-runner
   vars:
     ansible_ssh_pipelining: true
+
+# Tailscale — mesh VPN for reaching HIL devices (Pi, ESP32) from CI
+- name: Check if Tailscale is installed
+  command: tailscale --version
+  register: tailscale_check
+  changed_when: false
+  failed_when: false
+  tags: [tailscale]
+
+- name: Install Tailscale
+  shell: curl -fsSL https://tailscale.com/install.sh | sh
+  when: tailscale_check.rc != 0
+  tags: [tailscale]
+
+- name: Check Tailscale status
+  command: tailscale status
+  register: tailscale_status
+  changed_when: false
+  failed_when: false
+  tags: [tailscale]
+
+- name: Authenticate Tailscale
+  command: tailscale up --authkey={{ tailscale_auth_key }}
+  when: tailscale_status.rc != 0
+  tags: [tailscale]
+
+- name: Set PI_HOST environment variable for HIL tests
+  lineinfile:
+    path: /etc/environment
+    line: 'PI_HOST="pi@{{ pi_tailscale_ip }}"'
+    regexp: '^PI_HOST='
+    create: yes
+  tags: [tailscale]
+
+# SSH keypair for gitlab-runner to reach HIL devices
+- name: Check if gitlab-runner SSH key exists
+  stat:
+    path: /home/gitlab-runner/.ssh/id_ed25519
+  register: runner_ssh_key_exists
+  tags: [tailscale]
+
+- name: Generate SSH keypair for gitlab-runner
+  become: yes
+  become_user: gitlab-runner
+  command: ssh-keygen -t ed25519 -C "gitlab-runner@ci" -f /home/gitlab-runner/.ssh/id_ed25519 -N ""
+  args:
+    creates: /home/gitlab-runner/.ssh/id_ed25519
+  tags: [tailscale]
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Read gitlab-runner public key
+  slurp:
+    src: /home/gitlab-runner/.ssh/id_ed25519.pub
+  register: runner_pub_key
+  tags: [tailscale]
+
+- name: Trust Pi host key
+  become: yes
+  become_user: gitlab-runner
+  shell: ssh-keyscan -H {{ pi_tailscale_ip }} >> /home/gitlab-runner/.ssh/known_hosts
+  args:
+    creates: /home/gitlab-runner/.ssh/known_hosts
+  tags: [tailscale]
+  vars:
+    ansible_ssh_pipelining: true
+
+- name: Display gitlab-runner public key
+  debug:
+    msg: >
+      Add this key to pi@{{ pi_tailscale_ip }}:~/.ssh/authorized_keys:
+      {{ runner_pub_key.content | b64decode }}
+  when: not runner_ssh_key_exists.stat.exists
+  tags: [tailscale]

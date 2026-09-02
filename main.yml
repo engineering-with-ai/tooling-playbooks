@@ -4,10 +4,10 @@
     setup_type: "dev-services"
     debian_release: "trixie"
     project_name: fsenergy
-    rust_version: "1.90.0"
+    rust_version: "1.98.0"
     python_version: "3.13.2"
     uv_version: "0.10.9"
-    node_version: "22.14.0"
+    node_version: "24"
     postgres_version: "15"
     prometheus_version: "v3.1.0"
     grafana_version: "11.5.1"
@@ -16,8 +16,8 @@
     mender_version: "mender-master"
     hawkbit_version: "0.9.0"
     coding_llm_name: "qwen3-coder:30b"
-    conversational_llm_name: "llama3.1:70b"
-    embedding_model: "nomic-embed-text:v1.5"
+    conversational_llm_name: "gemma4:26b"
+    embedding_model: "qwen3-embedding:4b"
     external_ip: "173.211.12.43"
     pi_tailscale_ip: "100.126.118.103"
     pgvector_version: "v0.8.0"
@@ -133,16 +133,32 @@
         mode: '0644'
       tags: [nodejs]
 
-    - name: Add NodeSource repository
-      shell: curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+    - name: Detect installed Node major version
+      command: node -p "process.versions.node.split('.')[0]"
+      register: node_major_installed
+      changed_when: false
+      failed_when: false
+      tags: [nodejs]
+
+    # Reason: the setup_N.x script's `creates:` guard means a bump to a new
+    # major won't re-run unless we clear the stale repo file first.
+    - name: Drop stale NodeSource repo when the pinned major changed
+      file:
+        path: /etc/apt/sources.list.d/nodesource.list
+        state: absent
+      when: node_major_installed.stdout | default('') != node_version
+      tags: [nodejs]
+
+    - name: Add NodeSource repository (Node {{ node_version }})
+      shell: curl -fsSL https://deb.nodesource.com/setup_{{ node_version }}.x | sudo -E bash -
       args:
         creates: /etc/apt/sources.list.d/nodesource.list
       tags: [nodejs]
 
-    - name: Install Node.js
+    - name: Install / upgrade Node.js
       apt:
         name: nodejs
-        state: present
+        state: latest
         update_cache: yes
       tags: [nodejs]
 
@@ -154,6 +170,7 @@
     - name: Run dev services setup
       include_tasks: dev-services-setup.yml
       when: setup_type in ["dev-services", "all"]
+      tags: [dev-services, ollama, mongodb]
 
     - name: Run dev environment setup
       include_tasks: dev-environment-setup.yml

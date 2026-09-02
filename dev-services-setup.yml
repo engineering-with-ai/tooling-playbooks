@@ -383,31 +383,49 @@
   failed_when: false
 
 # MongoDB Installation
-- name: Add MongoDB GPG key
+# Reason: MongoDB 8.0 publishes a SHA256-signed key (Trixie-compatible) and
+# Mender Server master defaults to MongoDB 8.0 in its upstream compose/Helm.
+# MongoDB has no native trixie apt channel yet, so we use bookworm/mongodb-org/8.0
+# which works on Trixie because lib deps are compatible.
+- name: Remove stale MongoDB 7.0 apt repo
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/apt/sources.list.d/mongodb-org-7.0.list
+    - /etc/apt/keyrings/mongodb-server-7.0.gpg
+  tags: [mongodb]
+
+- name: Add MongoDB 8.0 GPG key
   get_url:
-    url: https://www.mongodb.org/static/pgp/server-7.0.asc
-    dest: /tmp/mongodb-server-7.0.asc
+    url: https://www.mongodb.org/static/pgp/server-8.0.asc
+    dest: /tmp/mongodb-server-8.0.asc
     mode: "0644"
+  tags: [mongodb]
 
-- name: Import MongoDB GPG key
-  shell: gpg -o /etc/apt/keyrings/mongodb-server-7.0.gpg --dearmor /tmp/mongodb-server-7.0.asc
+- name: Import MongoDB 8.0 GPG key
+  shell: gpg -o /etc/apt/keyrings/mongodb-server-8.0.gpg --dearmor /tmp/mongodb-server-8.0.asc
   args:
-    creates: /etc/apt/keyrings/mongodb-server-7.0.gpg
+    creates: /etc/apt/keyrings/mongodb-server-8.0.gpg
+  tags: [mongodb]
 
-- name: Add MongoDB repository
+- name: Add MongoDB 8.0 repository
   copy:
-    dest: /etc/apt/sources.list.d/mongodb-org-7.0.list
-    content: 'deb [arch=amd64,arm64 signed-by=/etc/apt/keyrings/mongodb-server-7.0.gpg] https://repo.mongodb.org/apt/debian bookworm/mongodb-org/7.0 main'
+    dest: /etc/apt/sources.list.d/mongodb-org-8.0.list
+    content: 'deb [arch=amd64,arm64 signed-by=/etc/apt/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/debian bookworm/mongodb-org/8.0 main'
     mode: "0644"
+  tags: [mongodb]
 
 - name: Update apt cache for MongoDB
   apt:
     update_cache: yes
+  tags: [mongodb]
 
 - name: Install MongoDB packages
   apt:
     name: mongodb-org
-    state: present
+    state: latest
+  tags: [mongodb]
 
 - name: Create MongoDB data directory
   file:
@@ -416,6 +434,7 @@
     owner: mongodb
     group: mongodb
     mode: "0755"
+  tags: [mongodb]
 
 - name: Create MongoDB log directory
   file:
@@ -424,6 +443,7 @@
     owner: mongodb
     group: mongodb
     mode: "0755"
+  tags: [mongodb]
 
 - name: Copy MongoDB configuration
   template:
@@ -431,24 +451,73 @@
     dest: /etc/mongod.conf
     mode: "0644"
   register: mongod_config_changed
+  tags: [mongodb]
+
+- name: Create mongod.service.d drop-in directory
+  file:
+    path: /etc/systemd/system/mongod.service.d
+    state: directory
+    mode: "0755"
+  tags: [mongodb]
+
+- name: Install mongod systemd drop-in to wait for docker.service
+  # Reason: mongod.conf binds to 172.17.0.1 (docker0 bridge). On clean boot
+  # mongod.service races docker.service and the docker0 interface does not
+  # yet exist, causing mongod to exit 48 (SocketException: Cannot assign
+  # requested address). Ordering mongod after docker eliminates the race.
+  copy:
+    dest: /etc/systemd/system/mongod.service.d/wait-for-docker.conf
+    mode: "0644"
+    content: |
+      [Unit]
+      After=docker.service
+      Wants=docker.service
+  register: mongod_dropin_changed
+  tags: [mongodb]
+
+- name: Reload systemd if mongod drop-in changed
+  systemd:
+    daemon_reload: yes
+  when: mongod_dropin_changed.changed
+  tags: [mongodb]
 
 - name: Start and enable MongoDB service
   systemd:
     name: mongod
     state: started
     enabled: yes
+  tags: [mongodb]
 
 - name: Restart MongoDB if configuration changed
   systemd:
     name: mongod
     state: restarted
   when: mongod_config_changed.changed
+  tags: [mongodb]
 
 - name: Check if MongoDB is running
   command: systemctl is-active mongod
   register: mongodb_status
   changed_when: false
   failed_when: false
+  tags: [mongodb]
+
+- name: Read MongoDB featureCompatibilityVersion
+  # Reason: after a major-version binary upgrade (e.g. 7.0 → 8.0), FCV stays at
+  # the old version and 8.0-only features remain locked until explicitly bumped.
+  command: >
+    mongosh --quiet admin --eval
+    "JSON.stringify(db.adminCommand({getParameter:1,featureCompatibilityVersion:1}))"
+  register: mongodb_fcv
+  changed_when: false
+  tags: [mongodb]
+
+- name: Set MongoDB featureCompatibilityVersion to 8.0
+  command: >
+    mongosh --quiet admin --eval
+    "db.adminCommand({setFeatureCompatibilityVersion:'8.0',confirm:true})"
+  when: '"8.0" not in mongodb_fcv.stdout'
+  tags: [mongodb]
 
 - name: Check if K3s is already installed
   stat:
@@ -466,55 +535,23 @@
     delay: 10
   timeout: 300
 
-- name: Check if Ollama is already installed
-  stat:
-    path: /usr/local/bin/ollama
-  register: ollama_installed
-
-- name: Install Ollama
-  shell: |
-    curl -fsSL https://ollama.ai/install.sh | sh
-  when: not ollama_installed.stat.exists
+- name: Ensure Ollama is installed and at latest version
+  # Reason: installer script self-detects existing installs and upgrades only if needed.
+  # The original 'when: not exists' guard never upgraded, blocking new model pulls.
+  shell: curl -fsSL https://ollama.ai/install.sh | sh
+  register: ollama_install
+  changed_when: >
+    'Installing ollama' in ollama_install.stdout or
+    'Upgrading ollama' in ollama_install.stdout or
+    'Downloading' in ollama_install.stdout
+  tags: [ollama]
 
 - name: Verify Ollama installation
   command: ollama --version
   register: ollama_version
   changed_when: false
   failed_when: ollama_version.rc != 0
-
-- name: Check if Ollama embedding model exists
-  shell: ollama list | grep "{{ embedding_model }}"
-  register: embedding_model_check
-  failed_when: false
-  changed_when: false
-
-- name: pull Ollama embedding model
-  shell: ollama pull {{ embedding_model }}
-  when: embedding_model_check.rc != 0
-
-- name: Check if Ollama coding model exists
-  shell: ollama list | grep "{{ coding_llm_name }}"
-  register: coding_model_check
-  failed_when: false
-  changed_when: false
-
-- name: Ollama Run Coding LLM # This may take a few minutes
-  shell: ollama run {{ coding_llm_name }}
-  register: model_run_result
-  changed_when: "'pulling manifest' in model_run_result.stdout"
-  when: coding_model_check.rc != 0
-
-- name: Check if Ollama conversational model exists
-  shell: ollama list | grep "{{ conversational_llm_name }}"
-  register: conversational_model_check
-  failed_when: false
-  changed_when: false
-
-- name: Ollama Run Conversational LLM # This may take a few minutes
-  shell: ollama run {{ conversational_llm_name }}
-  register: conversational_run_result
-  changed_when: "'pulling manifest' in conversational_run_result.stdout"
-  when: conversational_model_check.rc != 0
+  tags: [ollama]
 
 - name: Configure Ollama to listen on all interfaces (0.0.0.0)
   lineinfile:
@@ -524,17 +561,57 @@
     insertafter: '^\[Service\]'
     state: present
   register: ollama_config_changed
+  tags: [ollama]
 
 - name: Reload systemd daemon if configuration changed
   systemd:
     daemon_reload: yes
   when: ollama_config_changed.changed
+  tags: [ollama]
 
 - name: Restart Ollama service if configuration changed
   systemd:
     name: ollama
     state: restarted
   when: ollama_config_changed.changed
+  tags: [ollama]
+
+- name: Check if Ollama embedding model exists
+  shell: ollama list | grep "{{ embedding_model }}"
+  register: embedding_model_check
+  failed_when: false
+  changed_when: false
+  tags: [ollama]
+
+- name: Pull Ollama embedding model
+  shell: ollama pull {{ embedding_model }}
+  when: embedding_model_check.rc != 0
+  tags: [ollama]
+
+- name: Check if Ollama coding model exists
+  shell: ollama list | grep "{{ coding_llm_name }}"
+  register: coding_model_check
+  failed_when: false
+  changed_when: false
+  tags: [ollama]
+
+- name: Pull Ollama coding model
+  # Reason: prior 'ollama run' was interactive; pull is the correct non-interactive fetch.
+  shell: ollama pull {{ coding_llm_name }}
+  when: coding_model_check.rc != 0
+  tags: [ollama]
+
+- name: Check if Ollama conversational model exists
+  shell: ollama list | grep "{{ conversational_llm_name }}"
+  register: conversational_model_check
+  failed_when: false
+  changed_when: false
+  tags: [ollama]
+
+- name: Pull Ollama conversational model
+  shell: ollama pull {{ conversational_llm_name }}
+  when: conversational_model_check.rc != 0
+  tags: [ollama]
 - name: Create a directory for Docker files
   file:
     path: /home/admin/docker
